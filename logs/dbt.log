@@ -1,0 +1,39 @@
+==================== 2026-03-10T21:29:45.682270Z | 019cd9a7-e7cf-77d1-9d03-da9e1796488c ====================
+21:29:45.682646 [info ]: Installing dbt project and profile setup
+21:29:45.690093 [info ]: Info Created .vscode/extensions.json with dbt extension recommendation
+21:29:45.690403 [info ]: Success Project created successfully!
+21:29:45.690524 [info ]: Info Project name: jaffle_shop
+21:29:45.690556 [info ]: Info Project directory: jaffle_shop
+21:29:45.690587 [info ]: Info Setting up your profile...
+21:29:45.690934 [info ]: Loading ~/.dbt/profiles.yml
+21:29:45.692257 [info ]: Profile 'jaffle_shop' already exists. You can choose how to proceed.
+21:30:18.538994 [info ]: Info Profile setup cancelled.
+21:30:18.539189 [info ]: Validating profile inputs, adapters, and connection
+
+21:30:18.539298 [info ]: dbt-fusion 2.0.0-preview.143
+21:30:18.539688 [info ]: Started loading project
+21:30:18.542628 [info ]: Loading ~/.dbt/profiles.yml
+21:30:18.544607 [info ]: Finished loading project [  0.00s]
+21:30:18.544878 [info ]: Started debugging
+21:30:18.544938 [info ]: Debugging profile: dev
+21:30:18.544963 [info ]: Debugging dbt version: 2.0.0-preview.143
+21:30:18.544978 [info ]: Debugging platform: macos aarch64 (unix)
+21:30:18.545018 [info ]: Debugging adapter type: snowflake (remote)
+21:30:18.568579 [info ]: Debugging dependencies:
+  git: OK
+21:30:18.569033 [info ]: Debugging connection:
+  "account": "zna84829",
+  "user": "J_DAMARO",
+  "database": "DAMARO_FUSION",
+  "warehouse": "TRANSFORMING",
+  "schema": "DBT_JDAMARO",
+  "role": "TRANSFORMER"
+21:30:21.131871 [debug]: Query executed on node unknown:
+select 1 as id
+21:30:21.233389 [info ]: Debugging connection test: OK
+21:30:21.234520 [info ]: Debugged All checks passed!
+21:30:21.234708 [info ]: Finished debugging [  2.69s]
+21:30:21.471174 [info ]: New version available 2.0.0-preview.149 (run `dbt system update`)
+21:30:21.515940 [info ]: 
+==================== Execution Summary =====================
+Finished 'init' successfully for target 'dev' [35.8s]
