@@ -1,0 +1,13 @@
+# Terraform state & local data (never commit these)
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+
+# Sensitive overrides
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
