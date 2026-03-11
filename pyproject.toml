@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sao-converter"
+version = "1.0.0"
+description = "Convert dbt Platform PROD job schedules to model-level SAO freshness configs"
+requires-python = ">=3.11"
+dependencies = [
+    "ruamel.yaml>=0.18",
+    "python-hcl2>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+sao-converter = "sao_converter:main"
+
+[tool.setuptools]
+py-modules = ["sao_converter"]
