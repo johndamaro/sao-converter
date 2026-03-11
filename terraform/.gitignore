@@ -1,5 +1,6 @@
 # Auto-generated from your PROD dbt Platform account — personal to each user
 generated.tf
+generated.json
 
 # Terraform state & local data (never commit these)
 .terraform/

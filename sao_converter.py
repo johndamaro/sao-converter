@@ -15,11 +15,17 @@ Steps:
   6. Run dbt parse to validate
 """
 
+import json
 import re
 import sys
 import argparse
+import shutil
 import subprocess
 from pathlib import Path
+
+import hcl2
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # TOOL_ROOT is where this script lives (the job-sao-converter repo).
@@ -77,106 +83,35 @@ def warn(msg):    print(f"{YELLOW}[WARN]{NC}  {msg}")
 def error(msg):   print(f"{RED}[ERROR]{NC} {msg}", file=sys.stderr)
 
 
-# ── Dependency check ──────────────────────────────────────────────────────────
-def ensure_ruamel():
-    try:
-        import ruamel.yaml  # noqa: F401
-    except ImportError:
-        info("ruamel.yaml not found — installing...")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "ruamel.yaml"],
-            stdout=subprocess.DEVNULL,
-        )
-        ok("ruamel.yaml installed.")
-
-
 # ── Step 1: TF Parser ─────────────────────────────────────────────────────────
-def parse_tf_blocks(tf_text: str) -> list[dict]:
+def _extract_blocks(parsed: dict) -> list[dict]:
     """
-    Extract all `resource "type" "name" { ... }` blocks from HCL text.
-    Uses brace-counting to correctly handle nested blocks (e.g. triggers = { }).
-    Returns a list of dicts: {resource_type, resource_name, fields}.
+    Extract resource blocks from a parsed python-hcl2 dict.
+
+    python-hcl2 returns `resource` as a list of single-key dicts
+    (one per block), e.g.:
+        [{"dbtcloud_project": {"project_123": {"name": "..."}}}, ...]
+
+    Returns a flat list of dicts: {resource_type, resource_name, fields}.
     """
     blocks = []
-    search_from = 0
-
-    resource_re = re.compile(
-        r'resource\s+"([^"]+)"\s+"([^"]+)"\s+\{'
-    )
-
-    while True:
-        m = resource_re.search(tf_text, search_from)
-        if not m:
-            break
-
-        resource_type = m.group(1)
-        resource_name = m.group(2)
-        body_start    = m.end()  # position just after the opening {
-
-        # Walk forward counting braces to find the matching closing }
-        depth = 1
-        pos   = body_start
-        while pos < len(tf_text) and depth > 0:
-            ch = tf_text[pos]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-            pos += 1
-
-        body = tf_text[body_start : pos - 1]
-        search_from = pos
-
-        fields = _parse_fields(body)
-        blocks.append(
-            {
-                "resource_type": resource_type,
-                "resource_name": resource_name,
-                "fields":        fields,
-            }
-        )
-
+    for resource_block in parsed.get("resource", []):
+        for resource_type, names in resource_block.items():
+            for resource_name, fields in names.items():
+                blocks.append(
+                    {
+                        "resource_type": resource_type,
+                        "resource_name": resource_name,
+                        "fields":        fields,
+                    }
+                )
     return blocks
 
 
-def _parse_fields(body: str) -> dict:
-    """
-    Parse simple HCL field assignments from a block body.
-    Handles: strings, integers, booleans, and single-line lists.
-    Skips nested sub-blocks (e.g. triggers = { ... }).
-    """
-    fields = {}
-    for line in body.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        # key = "string"
-        m = re.match(r'^(\w+)\s*=\s*"([^"]*)"', line)
-        if m:
-            fields[m.group(1)] = m.group(2)
-            continue
-
-        # key = integer
-        m = re.match(r'^(\w+)\s*=\s*(-?\d+)$', line)
-        if m:
-            fields[m.group(1)] = int(m.group(2))
-            continue
-
-        # key = true | false
-        m = re.match(r'^(\w+)\s*=\s*(true|false)$', line)
-        if m:
-            fields[m.group(1)] = m.group(2) == "true"
-            continue
-
-        # key = ["item1", "item2"]  (single-line list)
-        m = re.match(r'^(\w+)\s*=\s*\[([^\]]*)\]', line)
-        if m:
-            items = re.findall(r'"([^"]*)"', m.group(2))
-            fields[m.group(1)] = items
-            continue
-
-    return fields
+def parse_tf_blocks(tf_path: Path) -> list[dict]:
+    """Convenience wrapper: load an HCL file and return its resource blocks."""
+    with open(tf_path) as f:
+        return _extract_blocks(hcl2.load(f))
 
 
 # ── Step 2: Find the SAO project ID ──────────────────────────────────────────
@@ -324,9 +259,6 @@ def inject_build_after(
     - Inserts `config:` immediately after the `name:` key to keep YML readable.
     - Returns True if the file was modified.
     """
-    from ruamel.yaml import YAML
-    from ruamel.yaml.comments import CommentedMap
-
     yaml = YAML()
     yaml.preserve_quotes = True
     yaml.width = 120
@@ -386,8 +318,6 @@ def resolve_dbtf() -> list[str]:
       2. The path that the shell alias points to (via `type -a dbtf`)
       3. A known common install location (~/.local/bin/dbt)
     """
-    import shutil
-
     # 1. Direct binary
     if shutil.which("dbtf"):
         return ["dbtf"]
@@ -442,7 +372,6 @@ def run_dbt_parse(dbt_project_dir: Path) -> bool:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    ensure_ruamel()
     args = parse_args()
 
     # ── Resolve paths ──────────────────────────────────────────────────────────
@@ -462,11 +391,17 @@ def main():
               "Pass --models-dir explicitly if your project uses a non-standard layout.")
         sys.exit(1)
 
-    # ── 1. Read & parse generated.tf ──────────────────────────────────────────
+    # ── 1. Read & parse generated.tf → JSON + blocks ──────────────────────────
     print(f"\n{'─'*60}")
     info(f"Reading {generated_tf}")
-    tf_text = generated_tf.read_text()
-    blocks  = parse_tf_blocks(tf_text)
+    with open(generated_tf) as f:
+        tf_parsed = hcl2.load(f)
+
+    generated_json = generated_tf.with_suffix(".json")
+    generated_json.write_text(json.dumps(tf_parsed, indent=2))
+    ok(f"Written JSON: {generated_json}")
+
+    blocks = _extract_blocks(tf_parsed)
     ok(f"Parsed {len(blocks)} resource blocks.")
 
     # ── 2. Locate the target project ──────────────────────────────────────────

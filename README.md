@@ -27,7 +27,7 @@ If you're running dbt Platform today, your deployment cadence lives inside your 
 | macOS with [Homebrew](https://brew.sh) | The setup script uses Homebrew to install Terraform and dbtcloud-terraforming automatically |
 | [Terraform](https://developer.hashicorp.com/terraform/install) | Installed automatically by `setup.sh` via `hashicorp/tap` |
 | [dbtcloud-terraforming](https://github.com/dbt-labs/dbtcloud-terraforming) | Installed automatically by `setup.sh` via `dbt-labs/dbt-cli` — this is what generates `generated.tf` from your live dbt Platform account |
-| Python 3.11+ | Comes with macOS; `ruamel.yaml` is installed automatically on first run |
+| Python 3.11+ | Comes with macOS; `ruamel.yaml` and `python-hcl2` are the only runtime dependencies — install them with `pip install ruamel.yaml python-hcl2` if needed |
 | [dbt Fusion (`dbtf`)](https://docs.getdbt.com/docs/dbt-versions/dbt-fusion) | Required for the final parse step |
 | dbt Platform account ID | Found in your dbt Platform URL or Account Settings |
 | dbt Platform service token | Create one at **Account Settings → Service Tokens** — Read access is sufficient |
@@ -40,8 +40,8 @@ If you're running dbt Platform today, your deployment cadence lives inside your 
 ### Step 1 — Clone the repo
 
 ```bash
-git clone https://github.com/johndamaro/job-sao-converter.git
-cd job-sao-converter
+git clone https://github.com/johndamaro/sao-converter.git
+cd sao-converter
 ```
 
 ### Step 2 — Set your credentials
@@ -80,7 +80,7 @@ cd ..
 
 ### Step 4 — Run the converter
 
-Point the script at your own dbt project using `--dbt-project-dir`. This is the repo where your model YML files live — not the `job-sao-converter` directory itself.
+Point the script at your own dbt project using `--dbt-project-dir`. This is the repo where your model YML files live — not the `sao-converter` directory itself.
 
 ```bash
 python3 sao_converter.py --dbt-project-dir /path/to/your/dbt/project
@@ -93,6 +93,8 @@ python3 sao_converter.py \
   --dbt-project-dir /path/to/your/dbt/project \
   --project-name "My Project"
 ```
+
+> **Tip:** After running `pip install -e .`, you can use `sao-converter` as a shorthand instead of `python3 sao_converter.py`.
 
 **Flags:**
 
@@ -138,10 +140,21 @@ models:
 
 ---
 
+## Development
+
+To run the unit tests, install the package in editable mode with dev dependencies:
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -v
+```
+
+---
+
 ## Feedback
 
 This tool is a work in progress and we'd love to hear how it's working for you.
 
-- **Something broken?** Open an issue at [github.com/johndamaro/job-sao-converter/issues](https://github.com/johndamaro/job-sao-converter/issues)
+- **Something broken?** Open an issue at [github.com/johndamaro/sao-converter/issues](https://github.com/johndamaro/sao-converter/issues)
 - **Works great?** Leave a ⭐ on the repo — it helps others find it
 - **Have ideas?** PRs are very welcome, especially for additional selector patterns or adapter-specific freshness handling
