@@ -4,6 +4,7 @@ Unit tests for sao_converter.py
 Run with:
     pytest tests/ -v
 """
+import json
 import textwrap
 from pathlib import Path
 
@@ -15,7 +16,9 @@ from sao_converter import (
     get_prod_jobs,
     get_project_id,
     inject_build_after,
-    steps_to_dirs,
+    load_manifest,
+    parse_step_selector,
+    patch_paths_for_models,
 )
 
 
@@ -52,60 +55,75 @@ class TestCronToBuildAfter:
         assert cron_to_build_after("0 * * *") == {"count": 24, "period": "hour"}
 
 
-# ── steps_to_dirs ─────────────────────────────────────────────────────────────
+# ── parse_step_selector ───────────────────────────────────────────────────────
 
-class TestStepsToDirs:
+class TestParseStepSelector:
     def test_build_with_wildcard_selector(self):
-        assert steps_to_dirs(["dbt build -s staging.*"]) == ["staging"]
+        assert parse_step_selector("dbt build -s staging.*") == (["staging.*"], [])
 
-    def test_run_with_model_selector(self):
-        assert steps_to_dirs(["dbt run -s marts.orders"]) == ["marts"]
+    def test_run_with_dot_model_selector(self):
+        assert parse_step_selector("dbt run -s marts.orders") == (["marts.orders"], [])
 
     def test_long_select_flag(self):
-        assert steps_to_dirs(["dbt build --select staging.*"]) == ["staging"]
+        assert parse_step_selector("dbt build --select staging.*") == (["staging.*"], [])
 
-    def test_seed_is_ignored(self):
-        assert steps_to_dirs(["dbt seed"]) == []
+    def test_multiple_s_flags(self):
+        sels, excls = parse_step_selector("dbt build -s staging.* -s marts.*")
+        assert sels == ["staging.*", "marts.*"]
+        assert excls == []
 
-    def test_test_is_ignored(self):
-        assert steps_to_dirs(["dbt test"]) == []
+    def test_exclude_single(self):
+        sels, excls = parse_step_selector("dbt run -s staging.* --exclude stg_orders")
+        assert sels == ["staging.*"]
+        assert excls == ["stg_orders"]
 
-    def test_source_freshness_is_ignored(self):
-        assert steps_to_dirs(["dbt source freshness"]) == []
+    def test_exclude_multiple(self):
+        sels, excls = parse_step_selector(
+            "dbt run -s staging.* --exclude stg_orders stg_customers"
+        )
+        assert sels == ["staging.*"]
+        assert excls == ["stg_orders", "stg_customers"]
 
-    def test_tag_selector_is_ignored(self):
-        assert steps_to_dirs(["dbt build -s tag:daily"]) == []
+    def test_graph_operator_plus(self):
+        sels, excls = parse_step_selector("dbt run -s +stg_orders+ --exclude specific_model")
+        assert sels == ["+stg_orders+"]
+        assert excls == ["specific_model"]
 
-    def test_source_selector_is_ignored(self):
-        assert steps_to_dirs(["dbt build -s source:mydb"]) == []
+    def test_seed_returns_empty(self):
+        assert parse_step_selector("dbt seed") == ([], [])
 
-    def test_no_selector_flag(self):
-        assert steps_to_dirs(["dbt build"]) == []
+    def test_test_returns_empty(self):
+        assert parse_step_selector("dbt test") == ([], [])
 
-    def test_deduplication_same_dir(self):
-        steps = [
-            "dbt run -s staging.stg_orders",
-            "dbt run -s staging.stg_customers",
-        ]
-        assert steps_to_dirs(steps) == ["staging"]
+    def test_source_freshness_returns_empty(self):
+        assert parse_step_selector("dbt source freshness") == ([], [])
 
-    def test_multiple_steps_different_dirs(self):
-        steps = [
-            "dbt build -s staging.*",
-            "dbt build -s marts.*",
-        ]
-        result = steps_to_dirs(steps)
-        assert set(result) == {"staging", "marts"}
+    def test_no_selector_flag_returns_empty_selectors(self):
+        assert parse_step_selector("dbt build") == ([], [])
 
-    def test_mixed_skipped_and_valid_steps(self):
-        steps = [
-            "dbt seed",
-            "dbt build -s staging.*",
-            "dbt test",
-            "dbt build -s marts.*",
-        ]
-        result = steps_to_dirs(steps)
-        assert set(result) == {"staging", "marts"}
+    def test_tag_selector_passed_through(self):
+        # Unlike old steps_to_dirs, tag: selectors pass through to dbtf ls
+        sels, excls = parse_step_selector("dbt build -s tag:daily")
+        assert sels == ["tag:daily"]
+        assert excls == []
+
+    def test_source_selector_passed_through(self):
+        sels, excls = parse_step_selector("dbt build -s source:ecom")
+        assert sels == ["source:ecom"]
+        assert excls == []
+
+    def test_select_and_exclude_long_form(self):
+        sels, excls = parse_step_selector(
+            "dbt run --select staging.* --exclude marts.*"
+        )
+        assert sels == ["staging.*"]
+        assert excls == ["marts.*"]
+
+    def test_unknown_subcommand_returns_empty(self):
+        assert parse_step_selector("dbt compile") == ([], [])
+
+    def test_empty_string_returns_empty(self):
+        assert parse_step_selector("") == ([], [])
 
 
 # ── Shared fixture blocks for get_* tests ─────────────────────────────────────
@@ -358,3 +376,98 @@ class TestInjectBuildAfter:
         """))
         inject_build_after(yml, {"count": 6, "period": "hour"}, updates_on="any")
         assert "updates_on: any" in yml.read_text()
+
+
+# ── patch_paths_for_models ────────────────────────────────────────────────────
+
+FAKE_MANIFEST = {
+    "nodes": {
+        "model.jaffle_shop.stg_orders": {
+            "resource_type": "model",
+            "patch_path": "models/staging/stg_orders.yml",
+        },
+        "model.jaffle_shop.stg_customers": {
+            "resource_type": "model",
+            "patch_path": "models/staging/stg_customers.yml",
+        },
+        "model.jaffle_shop.orders": {
+            "resource_type": "model",
+            "patch_path": "jaffle_shop://models/marts/orders.yml",  # old package:// prefix
+        },
+        "model.jaffle_shop.locations": {
+            "resource_type": "model",
+            "patch_path": None,  # model with no YML file
+        },
+    }
+}
+
+
+class TestPatchPathsForModels:
+    def test_returns_absolute_path(self, tmp_path):
+        uid = "model.jaffle_shop.stg_orders"
+        result = patch_paths_for_models([uid], FAKE_MANIFEST, tmp_path)
+        assert result == {tmp_path / "models" / "staging" / "stg_orders.yml"}
+
+    def test_strips_package_prefix(self, tmp_path):
+        uid = "model.jaffle_shop.orders"
+        result = patch_paths_for_models([uid], FAKE_MANIFEST, tmp_path)
+        assert result == {tmp_path / "models" / "marts" / "orders.yml"}
+
+    def test_skips_none_patch_path_silently(self, tmp_path):
+        uid = "model.jaffle_shop.locations"
+        result = patch_paths_for_models([uid], FAKE_MANIFEST, tmp_path)
+        assert result == set()
+
+    def test_skips_missing_unique_id(self, tmp_path):
+        result = patch_paths_for_models(["model.jaffle_shop.nonexistent"], FAKE_MANIFEST, tmp_path)
+        assert result == set()
+
+    def test_deduplicates_shared_yml(self, tmp_path):
+        manifest = {
+            "nodes": {
+                "model.proj.a": {"resource_type": "model", "patch_path": "models/staging/_staging.yml"},
+                "model.proj.b": {"resource_type": "model", "patch_path": "models/staging/_staging.yml"},
+            }
+        }
+        result = patch_paths_for_models(
+            ["model.proj.a", "model.proj.b"], manifest, tmp_path
+        )
+        assert len(result) == 1
+        assert result == {tmp_path / "models" / "staging" / "_staging.yml"}
+
+    def test_multiple_models_returns_multiple_paths(self, tmp_path):
+        uids = ["model.jaffle_shop.stg_orders", "model.jaffle_shop.stg_customers"]
+        result = patch_paths_for_models(uids, FAKE_MANIFEST, tmp_path)
+        assert len(result) == 2
+        assert tmp_path / "models" / "staging" / "stg_orders.yml" in result
+        assert tmp_path / "models" / "staging" / "stg_customers.yml" in result
+
+    def test_empty_unique_ids_returns_empty_set(self, tmp_path):
+        assert patch_paths_for_models([], FAKE_MANIFEST, tmp_path) == set()
+
+
+# ── load_manifest ─────────────────────────────────────────────────────────────
+
+class TestLoadManifest:
+    def test_loads_existing_manifest(self, tmp_path):
+        manifest_data = {"metadata": {"dbt_version": "2.0.0"}, "nodes": {}}
+        manifest_path = tmp_path / "target" / "manifest.json"
+        manifest_path.parent.mkdir(parents=True)
+        manifest_path.write_text(json.dumps(manifest_data))
+        result = load_manifest(tmp_path)
+        assert result["metadata"]["dbt_version"] == "2.0.0"
+
+    def test_missing_manifest_triggers_parse(self, tmp_path, monkeypatch):
+        def fake_parse(project_dir):
+            target = project_dir / "target"
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "manifest.json").write_text(json.dumps({"nodes": {}}))
+            return True
+        monkeypatch.setattr("sao_converter.run_dbt_parse", fake_parse)
+        result = load_manifest(tmp_path)
+        assert result == {"nodes": {}}
+
+    def test_failed_parse_exits(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("sao_converter.run_dbt_parse", lambda d: False)
+        with pytest.raises(SystemExit):
+            load_manifest(tmp_path)

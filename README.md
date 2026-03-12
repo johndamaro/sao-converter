@@ -28,7 +28,7 @@ If you're running dbt Platform today, your deployment cadence lives inside your 
 | [Terraform](https://developer.hashicorp.com/terraform/install) | Installed automatically by `setup.sh` via `hashicorp/tap` |
 | [dbtcloud-terraforming](https://github.com/dbt-labs/dbtcloud-terraforming) | Installed automatically by `setup.sh` via `dbt-labs/dbt-cli` — this is what generates `generated.tf` from your live dbt Platform account |
 | Python 3.11+ | Comes with macOS; `ruamel.yaml` and `python-hcl2` are the only runtime dependencies — install them with `pip install ruamel.yaml python-hcl2` if needed |
-| [dbt Fusion (`dbtf`)](https://docs.getdbt.com/docs/dbt-versions/dbt-fusion) | Required for the final parse step |
+| [dbt Fusion (`dbtf`)](https://docs.getdbt.com/docs/dbt-versions/dbt-fusion) | Required — used mid-run to resolve model selectors (`dbtf ls`) and validate YML at the end (`dbtf parse`). Must be on your `PATH`. |
 | dbt Platform account ID | Found in your dbt Platform URL or Account Settings |
 | dbt Platform service token | Create one at **Account Settings → Service Tokens** — Read access is sufficient |
 | dbt Platform host URL | Required — see common values in Step 2 below |
@@ -102,7 +102,6 @@ python3 sao_converter.py \
 |---|---|---|
 | `--dbt-project-dir` | ✅ Yes | Path to your dbt project directory (the one containing `dbt_project.yml`) |
 | `--project-name` | No | dbt Platform project name to target — prompted if multiple are found |
-| `--models-dir` | No | Path to your models directory (defaults to `<dbt-project-dir>/models`) |
 | `--generated-tf` | No | Path to `generated.tf` if it lives somewhere other than `terraform/generated.tf` |
 
 ### Step 5 — Review and commit
