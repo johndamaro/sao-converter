@@ -10,13 +10,14 @@ Steps:
   1. Read terraform/generated.tf
   2. Identify PROD environment(s) for the SAO Job Converter project
   3. Find all jobs running in those environments; extract steps + cron
-  4. Map dbt selectors (e.g. staging.*) to model directories
+  4. Resolve dbt selectors via `dbtf ls` + manifest.json to find exact YML files
   5. Inject freshness.build_after into existing model YML files only
   6. Run dbt parse to validate
 """
 
 import json
 import re
+import shlex
 import sys
 import argparse
 import shutil
@@ -55,12 +56,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="dbt Platform project name to target (default: auto-detected from generated.tf — "
              "prompts if multiple projects are found).",
-    )
-    parser.add_argument(
-        "--models-dir",
-        type=Path,
-        default=None,
-        help="Path to the models directory (default: <dbt-project-dir>/models).",
     )
     parser.add_argument(
         "--generated-tf",
@@ -205,44 +200,50 @@ def cron_to_build_after(cron: str) -> dict:
     return {"count": 24, "period": "hour"}
 
 
-# ── dbt selector → model directories ─────────────────────────────────────────
-def steps_to_dirs(steps: list[str]) -> list[str]:
+# ── dbt selector extraction ───────────────────────────────────────────────────
+def parse_step_selector(step: str) -> tuple[list[str], list[str]]:
     """
-    Parse execute_steps and return unique model directory names.
+    Extract (selectors, excludes) from a single dbt job step string.
 
-    Recognised selectors:
-      dbt build/run -s folder.*   → [folder]
-      dbt build/run -s folder.model_name → [folder]
+    Returns ([], []) for non-model commands (seed, test, source, compile, etc.)
+    and for run/build steps that have no -s/--select flag.
 
-    Skipped:
-      dbt seed / dbt test / dbt source freshness / tag: / source:
+    Unlike the old steps_to_dirs(), tag: and source: selectors are passed
+    through unchanged — dbtf ls handles all valid dbt selector syntax natively.
     """
-    dirs = []
-    selector_re = re.compile(r"(?:-s|--select)\s+(\S+)")
+    MODEL_COMMANDS = {"run", "build"}
+    SKIP_COMMANDS  = {
+        "seed", "test", "snapshot", "source", "compile",
+        "generate", "debug", "deps", "clean", "docs",
+    }
+    try:
+        tokens = shlex.split(step.strip())
+    except ValueError:
+        warn(f"Could not parse step (unbalanced quotes?): {step!r}")
+        return [], []
 
-    for step in steps:
-        # Skip non-model commands
-        if re.match(r"dbt\s+(seed|test|source)", step.strip()):
-            continue
+    if len(tokens) < 2 or tokens[0] != "dbt":
+        return [], []
+    if tokens[1] in SKIP_COMMANDS or tokens[1] not in MODEL_COMMANDS:
+        return [], []
 
-        m = selector_re.search(step)
-        if not m:
-            continue
+    selectors: list[str] = []
+    excludes:  list[str] = []
+    i = 2
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("-s", "--select"):
+            i += 1
+            while i < len(tokens) and not tokens[i].startswith("-"):
+                selectors.append(tokens[i]); i += 1
+        elif tok == "--exclude":
+            i += 1
+            while i < len(tokens) and not tokens[i].startswith("-"):
+                excludes.append(tokens[i]); i += 1
+        else:
+            i += 1  # skip unknown flags / their values
 
-        pattern = m.group(1)
-
-        # tag: / source: — not directory-based
-        if pattern.startswith(("tag:", "source:")):
-            continue
-
-        # folder.*  or  folder.model
-        folder_m = re.match(r"^([a-zA-Z_]+)\.", pattern)
-        if folder_m:
-            folder = folder_m.group(1)
-            if folder not in dirs:
-                dirs.append(folder)
-
-    return dirs
+    return selectors, excludes
 
 
 # ── Step 5: Inject build_after into YML ───────────────────────────────────────
@@ -370,6 +371,93 @@ def run_dbt_parse(dbt_project_dir: Path) -> bool:
     return result.returncode == 0
 
 
+# ── Manifest helpers ──────────────────────────────────────────────────────────
+def load_manifest(dbt_project_dir: Path) -> dict:
+    """
+    Load target/manifest.json from the dbt project.
+    Runs `dbtf parse` first if the file doesn't exist.
+    """
+    manifest_path = dbt_project_dir / "target" / "manifest.json"
+    if not manifest_path.exists():
+        info("target/manifest.json not found — running dbtf parse to generate it...")
+        if not run_dbt_parse(dbt_project_dir):
+            error("dbtf parse failed; cannot load manifest. Aborting.")
+            sys.exit(1)
+    with open(manifest_path) as fh:
+        return json.load(fh)
+
+
+def resolve_models_via_ls(
+    selectors: list[str],
+    excludes: list[str],
+    dbt_project_dir: Path,
+    dbtf_cmd: list[str],
+) -> list[str]:
+    """
+    Run `dbtf ls` with the given selectors and return a list of model unique_ids.
+    Non-JSON banner lines in stdout are silently ignored.
+    Returns [] for empty selectors or on non-zero exit code.
+    """
+    if not selectors:
+        return []
+
+    cmd = list(dbtf_cmd) + ["ls"]
+    for sel in selectors:
+        cmd += ["-s", sel]
+    for ex in excludes:
+        cmd += ["--exclude", ex]
+    cmd += ["--output", "json", "--output-keys", "unique_id", "resource_type"]
+
+    result = subprocess.run(cmd, cwd=dbt_project_dir, capture_output=True, text=True)
+    if result.returncode != 0:
+        warn(f"  dbtf ls exited {result.returncode} — skipping step.")
+        if result.stderr:
+            print(result.stderr.strip())
+        return []
+
+    unique_ids = []
+    for line in result.stdout.splitlines():
+        try:
+            obj = json.loads(line.strip())
+        except json.JSONDecodeError:
+            continue
+        if obj.get("resource_type") == "model":
+            unique_ids.append(obj["unique_id"])
+
+    if not unique_ids:
+        warn(f"  dbtf ls matched 0 models for selectors={selectors} excludes={excludes}")
+    return unique_ids
+
+
+def patch_paths_for_models(
+    unique_ids: list[str],
+    manifest: dict,
+    dbt_project_dir: Path,
+) -> set[Path]:
+    """
+    Look up patch_path for each unique_id in the manifest.
+    Strips optional "package://" prefix (older dbt Core manifest format).
+    Returns a deduplicated set of absolute Paths.
+    Models with patch_path=None are silently skipped (no YML file — expected).
+    """
+    paths: set[Path] = set()
+    nodes = manifest.get("nodes", {})
+    for uid in unique_ids:
+        node = nodes.get(uid)
+        if node is None:
+            warn(f"  {uid} not found in manifest (stale manifest?) — skipping.")
+            continue
+        patch_path = node.get("patch_path")
+        if not patch_path:
+            continue  # model has no YML — skip silently
+        if "://" in patch_path:
+            _, relative = patch_path.split("://", 1)
+        else:
+            relative = patch_path
+        paths.add(dbt_project_dir / relative)
+    return paths
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     args = parse_args()
@@ -377,7 +465,6 @@ def main():
     # ── Resolve paths ──────────────────────────────────────────────────────────
     generated_tf    = args.generated_tf
     dbt_project_dir = args.dbt_project_dir.resolve()
-    models_dir      = (args.models_dir or dbt_project_dir / "models").resolve()
 
     if not dbt_project_dir.exists():
         error(f"--dbt-project-dir not found: {dbt_project_dir}")
@@ -385,10 +472,6 @@ def main():
     if not (dbt_project_dir / "dbt_project.yml").exists():
         error(f"No dbt_project.yml found in {dbt_project_dir}. "
               "Make sure --dbt-project-dir points to the root of your dbt project.")
-        sys.exit(1)
-    if not models_dir.exists():
-        error(f"Models directory not found: {models_dir}. "
-              "Pass --models-dir explicitly if your project uses a non-standard layout.")
         sys.exit(1)
 
     # ── 1. Read & parse generated.tf → JSON + blocks ──────────────────────────
@@ -436,7 +519,6 @@ def main():
 
     ok(f"Project: '{project_name}' (ID: {project_id})")
     info(f"dbt project dir : {dbt_project_dir}")
-    info(f"Models dir      : {models_dir}")
 
     # ── 3. Find production environments ───────────────────────────────────────
     prod_env_ids = get_prod_env_ids(blocks, project_id)
@@ -454,55 +536,50 @@ def main():
         sys.exit(1)
     ok(f"Found {len(prod_jobs)} PROD job(s).")
 
-    job_mappings = []
-    for job in prod_jobs:
-        name        = job.get("name", "unnamed")
-        cron        = job.get("schedule_cron", "")
-        steps       = job.get("execute_steps", [])
-        build_after = cron_to_build_after(cron)
-        dirs        = steps_to_dirs(steps)
-
-        print()
-        info(f"Job: '{name}'")
-        print(f"         Cron     : {cron}")
-        print(f"         Steps    : {steps}")
-        print(f"         Dirs     : {dirs}")
-        print(f"         build_after → every {build_after['count']} {build_after['period']}(s), updates_on: all")
-
-        if dirs:
-            job_mappings.append({"name": name, "dirs": dirs, "build_after": build_after})
+    # ── 4b. Load manifest & resolve dbtf command ──────────────────────────────
+    print(f"\n{'─'*60}")
+    info("Loading dbt manifest...")
+    dbtf_cmd = resolve_dbtf()
+    manifest = load_manifest(dbt_project_dir)
+    ok("Manifest loaded.")
 
     # ── 5. Inject build_after into model YMLs ─────────────────────────────────
     print(f"\n{'─'*60}")
     info("Injecting freshness.build_after into model YML files...")
     total_updated = 0
 
-    for mapping in job_mappings:
+    for job in prod_jobs:
+        name        = job.get("name", "unnamed")
+        cron        = job.get("schedule_cron", "")
+        steps       = job.get("execute_steps", [])
+        build_after = cron_to_build_after(cron)
+
         print()
-        info(f"Job: '{mapping['name']}'")
-        for folder in mapping["dirs"]:
-            folder_path = models_dir / folder
-            if not folder_path.exists():
-                warn(f"  Directory models/{folder}/ not found — skipping.")
+        info(f"Job: '{name}'  →  every {build_after['count']} {build_after['period']}(s)")
+        print(f"         Cron  : {cron}")
+        print(f"         Steps : {steps}")
+
+        all_yml_paths: set[Path] = set()
+        for step in steps:
+            selectors, excludes = parse_step_selector(step)
+            if not selectors:
                 continue
+            info(f"  Resolving: {step!r}")
+            unique_ids = resolve_models_via_ls(selectors, excludes, dbt_project_dir, dbtf_cmd)
+            all_yml_paths |= patch_paths_for_models(unique_ids, manifest, dbt_project_dir)
 
-            yml_files = [
-                p for p in folder_path.glob("*.yml")
-                if not p.name.startswith("__")
-            ]
+        if not all_yml_paths:
+            warn(f"  No YML files found for job '{name}' — skipping.")
+            continue
 
-            if not yml_files:
-                warn(f"  No model YML files in models/{folder}/ — skipping.")
-                continue
-
-            for yml_path in sorted(yml_files):
-                label   = yml_path.relative_to(dbt_project_dir)
-                updated = inject_build_after(yml_path, mapping["build_after"])
-                if updated:
-                    ok(f"  Updated: {label}")
-                    total_updated += 1
-                else:
-                    info(f"  No changes: {label}")
+        for yml_path in sorted(all_yml_paths):
+            label   = yml_path.relative_to(dbt_project_dir)
+            updated = inject_build_after(yml_path, build_after)
+            if updated:
+                ok(f"  Updated: {label}")
+                total_updated += 1
+            else:
+                info(f"  No changes: {label}")
 
     print()
     ok(f"Done — {total_updated} file(s) updated.")
