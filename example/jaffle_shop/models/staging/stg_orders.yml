@@ -3,7 +3,7 @@ models:
   config:
     freshness:
       build_after:
-        count: 6
+        count: 3
         period: hour
         updates_on: all
   description: Order data with basic cleaning and transformation applied, one row per order.

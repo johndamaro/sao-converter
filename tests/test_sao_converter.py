@@ -15,10 +15,13 @@ from sao_converter import (
     get_prod_env_ids,
     get_prod_jobs,
     get_project_id,
+    group_models_by_yml,
+    hours_for_build_after,
     inject_build_after,
     load_manifest,
     parse_step_selector,
     patch_paths_for_models,
+    write_project_freshness_default,
 )
 
 
@@ -294,7 +297,7 @@ class TestInjectBuildAfter:
               - name: order_id
                 description: PK.
         """))
-        result = inject_build_after(yml, {"count": 6, "period": "hour"})
+        result = inject_build_after(yml, {"stg_orders": {"count": 6, "period": "hour"}})
         assert result is True
         content = yml.read_text()
         assert "build_after" in content
@@ -311,7 +314,7 @@ class TestInjectBuildAfter:
               tables:
               - name: raw_orders
         """))
-        result = inject_build_after(yml, {"count": 6, "period": "hour"})
+        result = inject_build_after(yml, {"raw_orders": {"count": 6, "period": "hour"}})
         assert result is False
         assert "build_after" not in yml.read_text()
 
@@ -328,10 +331,46 @@ class TestInjectBuildAfter:
                     updates_on: all
               description: Already configured.
         """))
-        result = inject_build_after(yml, {"count": 6, "period": "hour"})
+        result = inject_build_after(yml, {"stg_customers": {"count": 6, "period": "hour"}})
         assert result is False
         # Original count should be preserved
         assert "count: 12" in yml.read_text()
+
+    def test_skips_model_not_in_model_configs(self, tmp_path):
+        yml = tmp_path / "staging.yml"
+        yml.write_text(textwrap.dedent("""\
+            models:
+            - name: stg_orders
+              description: Orders.
+            - name: stg_customers
+              description: Customers.
+        """))
+        # Only stg_orders is covered — stg_customers should be left untouched
+        result = inject_build_after(yml, {"stg_orders": {"count": 6, "period": "hour"}})
+        assert result is True
+        content = yml.read_text()
+        assert "count: 6" in content
+        # stg_customers has no config block at all
+        assert content.count("build_after") == 1
+
+    def test_mixed_frequencies_in_shared_yml(self, tmp_path):
+        yml = tmp_path / "staging.yml"
+        yml.write_text(textwrap.dedent("""\
+            models:
+            - name: stg_orders
+              description: Orders.
+            - name: stg_customers
+              description: Customers.
+        """))
+        model_configs = {
+            "stg_orders":    {"count": 3,  "period": "hour"},
+            "stg_customers": {"count": 12, "period": "hour"},
+        }
+        result = inject_build_after(yml, model_configs)
+        assert result is True
+        content = yml.read_text()
+        assert "count: 3" in content
+        assert "count: 12" in content
 
     def test_config_key_appears_immediately_after_name(self, tmp_path):
         yml = tmp_path / "stg_products.yml"
@@ -340,7 +379,7 @@ class TestInjectBuildAfter:
             - name: stg_products
               description: Products.
         """))
-        inject_build_after(yml, {"count": 24, "period": "hour"})
+        inject_build_after(yml, {"stg_products": {"count": 24, "period": "hour"}})
         lines = yml.read_text().splitlines()
         name_idx   = next(i for i, l in enumerate(lines) if "name: stg_products" in l)
         config_idx = next(i for i, l in enumerate(lines) if "config:" in l)
@@ -356,7 +395,7 @@ class TestInjectBuildAfter:
                 - daily
               description: Orders mart.
         """))
-        result = inject_build_after(yml, {"count": 12, "period": "hour"})
+        result = inject_build_after(yml, {"orders": {"count": 12, "period": "hour"}})
         assert result is True
         content = yml.read_text()
         assert "build_after" in content
@@ -365,7 +404,7 @@ class TestInjectBuildAfter:
     def test_empty_file_returns_false(self, tmp_path):
         yml = tmp_path / "empty.yml"
         yml.write_text("")
-        assert inject_build_after(yml, {"count": 6, "period": "hour"}) is False
+        assert inject_build_after(yml, {"some_model": {"count": 6, "period": "hour"}}) is False
 
     def test_updates_on_parameter_respected(self, tmp_path):
         yml = tmp_path / "stg_locations.yml"
@@ -374,7 +413,7 @@ class TestInjectBuildAfter:
             - name: stg_locations
               description: Locations.
         """))
-        inject_build_after(yml, {"count": 6, "period": "hour"}, updates_on="any")
+        inject_build_after(yml, {"stg_locations": {"count": 6, "period": "hour"}}, updates_on="any")
         assert "updates_on: any" in yml.read_text()
 
 
@@ -444,6 +483,147 @@ class TestPatchPathsForModels:
 
     def test_empty_unique_ids_returns_empty_set(self, tmp_path):
         assert patch_paths_for_models([], FAKE_MANIFEST, tmp_path) == set()
+
+
+# ── hours_for_build_after ─────────────────────────────────────────────────────
+
+class TestHoursForBuildAfter:
+    def test_hours_period(self):
+        assert hours_for_build_after({"count": 6, "period": "hour"}) == 6.0
+
+    def test_daily_in_hours(self):
+        assert hours_for_build_after({"count": 24, "period": "hour"}) == 24.0
+
+    def test_day_period(self):
+        assert hours_for_build_after({"count": 1, "period": "day"}) == 24.0
+
+
+# ── write_project_freshness_default ───────────────────────────────────────────
+
+class TestWriteProjectFreshnessDefault:
+    def _make_dbt_project_yml(self, tmp_path, content: str) -> Path:
+        p = tmp_path / "dbt_project.yml"
+        p.write_text(textwrap.dedent(content))
+        return p
+
+    def test_adds_freshness_to_existing_models_block(self, tmp_path):
+        self._make_dbt_project_yml(tmp_path, """\
+            name: my_project
+            models:
+              my_project:
+                +materialized: view
+        """)
+        write_project_freshness_default(tmp_path, {"count": 12, "period": "hour"})
+        content = (tmp_path / "dbt_project.yml").read_text()
+        assert "+freshness" in content
+        assert "count: 12" in content
+        assert "+materialized: view" in content  # existing key preserved
+
+    def test_overwrites_existing_freshness_idempotent(self, tmp_path):
+        self._make_dbt_project_yml(tmp_path, """\
+            name: my_project
+            models:
+              my_project:
+                +freshness:
+                  build_after:
+                    count: 6
+                    period: hour
+                    updates_on: all
+        """)
+        write_project_freshness_default(tmp_path, {"count": 24, "period": "hour"})
+        content = (tmp_path / "dbt_project.yml").read_text()
+        assert "count: 24" in content
+        assert "count: 6" not in content
+
+    def test_returns_project_name(self, tmp_path):
+        self._make_dbt_project_yml(tmp_path, """\
+            name: jaffle_shop
+            models:
+              jaffle_shop: {}
+        """)
+        name = write_project_freshness_default(tmp_path, {"count": 24, "period": "hour"})
+        assert name == "jaffle_shop"
+
+
+# ── inject_build_after with default ───────────────────────────────────────────
+
+class TestInjectBuildAfterSkipsDefault:
+    def test_skips_when_matches_default(self, tmp_path):
+        yml = tmp_path / "stg_orders.yml"
+        yml.write_text(textwrap.dedent("""\
+            models:
+            - name: stg_orders
+              description: Orders.
+        """))
+        ba = {"count": 24, "period": "hour"}
+        result = inject_build_after(yml, {"stg_orders": ba}, default_build_after=ba)
+        assert result is False
+        assert "build_after" not in yml.read_text()
+
+    def test_injects_when_differs_from_default(self, tmp_path):
+        yml = tmp_path / "stg_orders.yml"
+        yml.write_text(textwrap.dedent("""\
+            models:
+            - name: stg_orders
+              description: Orders.
+        """))
+        result = inject_build_after(
+            yml,
+            {"stg_orders": {"count": 6, "period": "hour"}},
+            default_build_after={"count": 24, "period": "hour"},
+        )
+        assert result is True
+        assert "count: 6" in yml.read_text()
+
+
+# ── group_models_by_yml ───────────────────────────────────────────────────────
+
+class TestGroupModelsByYml:
+    def test_groups_single_model(self, tmp_path):
+        model_min_ba = {"model.jaffle_shop.stg_orders": {"count": 6, "period": "hour"}}
+        result = group_models_by_yml(model_min_ba, FAKE_MANIFEST, tmp_path)
+        expected_path = tmp_path / "models" / "staging" / "stg_orders.yml"
+        assert expected_path in result
+        assert result[expected_path] == {"stg_orders": {"count": 6, "period": "hour"}}
+
+    def test_two_models_same_yml(self, tmp_path):
+        manifest = {
+            "nodes": {
+                "model.proj.a": {"patch_path": "models/staging/_staging.yml"},
+                "model.proj.b": {"patch_path": "models/staging/_staging.yml"},
+            }
+        }
+        model_min_ba = {
+            "model.proj.a": {"count": 3,  "period": "hour"},
+            "model.proj.b": {"count": 12, "period": "hour"},
+        }
+        result = group_models_by_yml(model_min_ba, manifest, tmp_path)
+        yml_path = tmp_path / "models" / "staging" / "_staging.yml"
+        assert yml_path in result
+        assert result[yml_path] == {
+            "a": {"count": 3,  "period": "hour"},
+            "b": {"count": 12, "period": "hour"},
+        }
+
+    def test_strips_package_prefix(self, tmp_path):
+        uid = "model.jaffle_shop.orders"
+        result = group_models_by_yml({uid: {"count": 12, "period": "hour"}}, FAKE_MANIFEST, tmp_path)
+        expected = tmp_path / "models" / "marts" / "orders.yml"
+        assert expected in result
+
+    def test_skips_none_patch_path(self, tmp_path):
+        uid = "model.jaffle_shop.locations"  # patch_path is None in FAKE_MANIFEST
+        result = group_models_by_yml({uid: {"count": 6, "period": "hour"}}, FAKE_MANIFEST, tmp_path)
+        assert result == {}
+
+    def test_skips_missing_uid(self, tmp_path):
+        result = group_models_by_yml(
+            {"model.proj.nonexistent": {"count": 6, "period": "hour"}}, FAKE_MANIFEST, tmp_path
+        )
+        assert result == {}
+
+    def test_empty_input(self, tmp_path):
+        assert group_models_by_yml({}, FAKE_MANIFEST, tmp_path) == {}
 
 
 # ── load_manifest ─────────────────────────────────────────────────────────────
