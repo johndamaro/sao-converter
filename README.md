@@ -118,7 +118,25 @@ git commit -m "Add SAO build_after freshness configs from PROD job schedules"
 
 ## What Gets Written
 
-For each model with an existing YML file, the converter adds a `config` block immediately after the model `name`:
+### Project-level default (`dbt_project.yml`)
+
+The converter finds the least-frequent PROD job and writes that cadence as the default freshness for all models in your project:
+
+```yaml
+models:
+  my_project:
+    +freshness:
+      build_after:
+        count: 12   # ← slowest job schedule
+        period: hour
+        updates_on: all
+```
+
+Every model inherits this automatically — no per-model config needed.
+
+### Per-model overrides (model YML files)
+
+Models that run on a faster schedule than the project default get an explicit override written immediately after their `name:`:
 
 ```yaml
 models:
@@ -126,11 +144,19 @@ models:
     config:
       freshness:
         build_after:
-          count: 6
+          count: 3   # ← overrides the project default
           period: hour
           updates_on: all
     description: ...
 ```
+
+Models that only appear in the slowest job are left without a per-model config — they inherit the project default and stay clean.
+
+If a single YML file contains models from jobs with different cadences, each model gets its own correct override independently.
+
+---
+
+**General notes:**
 
 - `count` and `period` are derived from the job's cron schedule
 - `updates_on: all` means the model only rebuilds when all upstream sources have new data — the most cost-efficient default
