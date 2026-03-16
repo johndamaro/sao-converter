@@ -246,17 +246,109 @@ def parse_step_selector(step: str) -> tuple[list[str], list[str]]:
     return selectors, excludes
 
 
-# ── Step 5: Inject build_after into YML ───────────────────────────────────────
-def inject_build_after(
-    yml_path: Path,
+# ── Project-level default helpers ─────────────────────────────────────────────
+def hours_for_build_after(ba: dict) -> float:
+    """Normalise a build_after dict to hours for comparison."""
+    count  = ba.get("count", 24)
+    period = ba.get("period", "hour")
+    if period == "hour":
+        return float(count)
+    if period == "day":
+        return float(count) * 24
+    return float(count)
+
+
+def write_project_freshness_default(
+    dbt_project_dir: Path,
     build_after: dict,
     updates_on: str = "all",
+) -> str:
+    """
+    Upsert +freshness under models.<project_name> in dbt_project.yml.
+
+    Preserves all existing keys and comments.
+    Returns the project name read from the file.
+    """
+    yml_path = dbt_project_dir / "dbt_project.yml"
+    yaml = YAML()
+    yaml.preserve_quotes = True
+    yaml.width = 120
+
+    with open(yml_path) as fh:
+        data = yaml.load(fh)
+
+    project_name = data.get("name", "")
+
+    ba_map = CommentedMap()
+    ba_map["count"]      = build_after["count"]
+    ba_map["period"]     = build_after["period"]
+    ba_map["updates_on"] = updates_on
+
+    freshness_map = CommentedMap({"build_after": ba_map})
+
+    models_section  = data.setdefault("models", CommentedMap())
+    project_section = models_section.setdefault(project_name, CommentedMap())
+    project_section["+freshness"] = freshness_map
+
+    with open(yml_path, "w") as fh:
+        yaml.dump(data, fh)
+
+    return project_name
+
+
+# ── Step 5: Group models by YML + inject ──────────────────────────────────────
+def group_models_by_yml(
+    model_min_ba: dict[str, dict],
+    manifest: dict,
+    dbt_project_dir: Path,
+) -> dict[Path, dict[str, dict]]:
+    """
+    Group models by their patch_path YML file.
+
+    model_min_ba: unique_id → minimum (most-frequent) build_after
+    Returns:      yml_path  → {model_name: build_after}
+
+    Handles both bare paths and "package://" prefixes in patch_path.
+    Models with patch_path=None (no YML file) are silently skipped.
+    """
+    yml_configs: dict[Path, dict[str, dict]] = {}
+    nodes = manifest.get("nodes", {})
+    for uid, ba in model_min_ba.items():
+        node = nodes.get(uid)
+        if node is None:
+            warn(f"  {uid} not found in manifest (stale?) — skipping.")
+            continue
+        patch_path = node.get("patch_path")
+        if not patch_path:
+            continue
+        if "://" in patch_path:
+            _, relative = patch_path.split("://", 1)
+        else:
+            relative = patch_path
+        yml_path   = dbt_project_dir / relative
+        model_name = uid.rsplit(".", 1)[-1]
+        yml_configs.setdefault(yml_path, {})[model_name] = ba
+    return yml_configs
+
+
+def inject_build_after(
+    yml_path: Path,
+    model_configs: dict[str, dict],
+    updates_on: str = "all",
+    default_build_after: dict | None = None,
 ) -> bool:
     """
-    Add freshness.build_after config to every model entry in a YML file.
+    Inject freshness.build_after into specific models in a YML file.
+
+    model_configs maps model name → build_after. Only models present in this
+    dict are candidates for injection — others are left untouched. This allows
+    a single YML file to contain models from different jobs with different
+    frequencies, each getting the correct (most-frequent) config.
 
     - Skips files with no `models:` key (e.g. __sources.yml).
     - Skips models that already have a freshness config.
+    - Skips models not covered by any job selector (not in model_configs).
+    - Skips models whose build_after matches default_build_after (inherits from project).
     - Inserts `config:` immediately after the `name:` key to keep YML readable.
     - Returns True if the file was modified.
     """
@@ -273,9 +365,21 @@ def inject_build_after(
     modified = False
 
     for model in data["models"]:
+        name = model["name"]
+
         # Already configured — skip
         if "freshness" in model.get("config", {}):
-            warn(f"    {model['name']}: already has freshness config — skipping.")
+            warn(f"    {name}: already has freshness config — skipping.")
+            continue
+
+        # Not covered by any job selector — leave untouched
+        build_after = model_configs.get(name)
+        if build_after is None:
+            continue
+
+        # Matches project-level default — model will inherit; no override needed
+        if default_build_after and build_after == default_build_after:
+            info(f"    {name}: matches project default — skipping (will inherit).")
             continue
 
         # Build the nested config map
@@ -543,10 +647,12 @@ def main():
     manifest = load_manifest(dbt_project_dir)
     ok("Manifest loaded.")
 
-    # ── 5. Inject build_after into model YMLs ─────────────────────────────────
+    # ── 5. Resolve minimum build_after per model across all jobs (pass 1) ────────
     print(f"\n{'─'*60}")
-    info("Injecting freshness.build_after into model YML files...")
-    total_updated = 0
+    info("Resolving model selectors for all jobs...")
+
+    # uid → minimum (most-frequent) build_after across all jobs that touch it
+    model_min_ba: dict[str, dict] = {}
 
     for job in prod_jobs:
         name        = job.get("name", "unnamed")
@@ -559,30 +665,50 @@ def main():
         print(f"         Cron  : {cron}")
         print(f"         Steps : {steps}")
 
-        all_yml_paths: set[Path] = set()
         for step in steps:
             selectors, excludes = parse_step_selector(step)
             if not selectors:
                 continue
             info(f"  Resolving: {step!r}")
             unique_ids = resolve_models_via_ls(selectors, excludes, dbt_project_dir, dbtf_cmd)
-            all_yml_paths |= patch_paths_for_models(unique_ids, manifest, dbt_project_dir)
+            for uid in unique_ids:
+                current = model_min_ba.get(uid)
+                if current is None or hours_for_build_after(build_after) < hours_for_build_after(current):
+                    model_min_ba[uid] = build_after
 
-        if not all_yml_paths:
-            warn(f"  No YML files found for job '{name}' — skipping.")
-            continue
+    if not model_min_ba:
+        error("No models resolved from any job — nothing to do.")
+        sys.exit(1)
 
-        for yml_path in sorted(all_yml_paths):
-            label   = yml_path.relative_to(dbt_project_dir)
-            updated = inject_build_after(yml_path, build_after)
-            if updated:
-                ok(f"  Updated: {label}")
-                total_updated += 1
-            else:
-                info(f"  No changes: {label}")
+    # ── 5b. Determine project-level default (slowest schedule) ─────────────────
+    default_ba = max(model_min_ba.values(), key=hours_for_build_after)
+    print()
+    info(
+        f"Project default freshness: every {default_ba['count']} {default_ba['period']}(s) "
+        f"(least frequent job — all models inherit this unless overridden)."
+    )
+    project_name_from_yml = write_project_freshness_default(dbt_project_dir, default_ba)
+    ok(f"Written +freshness default to dbt_project.yml (project: '{project_name_from_yml}').")
+
+    # ── 5c. Group models by YML file and inject per-model overrides (pass 2) ───
+    print(f"\n{'─'*60}")
+    info("Injecting per-model overrides (skipping models that match the project default)...")
+
+    yml_model_configs = group_models_by_yml(model_min_ba, manifest, dbt_project_dir)
+    total_updated = 0
+
+    for yml_path in sorted(yml_model_configs):
+        model_configs = yml_model_configs[yml_path]
+        label         = yml_path.relative_to(dbt_project_dir)
+        updated       = inject_build_after(yml_path, model_configs, default_build_after=default_ba)
+        if updated:
+            ok(f"  Updated: {label}")
+            total_updated += 1
+        else:
+            info(f"  No changes: {label}")
 
     print()
-    ok(f"Done — {total_updated} file(s) updated.")
+    ok(f"Done — {total_updated} model YML file(s) updated.")
 
     # ── 6. dbt parse ──────────────────────────────────────────────────────────
     print(f"\n{'─'*60}")
